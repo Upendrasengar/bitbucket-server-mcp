@@ -1,0 +1,411 @@
+import { readFile } from "node:fs/promises";
+import { basename } from "node:path";
+import { z } from "zod";
+import { formatResponse } from "../response/format.js";
+import { toolAnnotations } from "../response/annotations.js";
+import { handleToolError } from "../http/errors.js";
+import {
+  curateList,
+  curateResponse,
+  DEFAULT_PROJECT_FIELDS,
+  DEFAULT_REPOSITORY_FIELDS,
+} from "../response/curate.js";
+import { getPaginated } from "../http/client.js";
+import type { ToolContext } from "./shared.js";
+import {
+  projectParam,
+  repositoryParam,
+  startParam,
+  fieldsParam,
+} from "./params.js";
+
+export function registerRepositoryTools(ctx: ToolContext) {
+  const { server, clients } = ctx;
+  server.registerTool(
+    "list_projects",
+    {
+      description:
+        "List all Bitbucket projects you have access to. Use this first to discover project keys. Supports custom field selection via the `fields` param (`'*all'` for full raw response, `'key,name'` for a custom subset).",
+      inputSchema: {
+        limit: z
+          .number()
+          .optional()
+          .describe("Number of projects to return (default: 25, max: 1000)"),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({ limit = 25, start = 0, fields }) => {
+      try {
+        const data = await getPaginated(clients.api, "projects", {
+          searchParams: { limit, start },
+        });
+
+        return formatResponse({
+          total: data.size,
+          projects: curateList(data.values, fields ?? DEFAULT_PROJECT_FIELDS),
+          isLastPage: data.isLastPage,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_repositories",
+    {
+      description:
+        "List repositories in a project. Use this to find repository slugs for other operations. Supports custom field selection via the `fields` param (`'*all'` for full raw response, `'slug,name'` for a custom subset).",
+      inputSchema: {
+        project: projectParam(),
+        limit: z
+          .number()
+          .optional()
+          .describe(
+            "Number of repositories to return (default: 25, max: 1000)",
+          ),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({ project, limit = 25, start = 0, fields }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const data = await getPaginated(
+          clients.api,
+          `projects/${resolvedProject}/repos`,
+          { searchParams: { limit, start } },
+        );
+
+        return formatResponse({
+          total: data.size,
+          repositories: curateList(
+            data.values,
+            fields ?? DEFAULT_REPOSITORY_FIELDS,
+          ),
+          isLastPage: data.isLastPage,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "browse_repository",
+    {
+      description:
+        "Browse files and directories in a repository to understand project structure.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        path: z
+          .string()
+          .optional()
+          .describe("Directory path to browse (default: root)."),
+        branch: z
+          .string()
+          .optional()
+          .describe("Branch or commit hash (default: default branch)."),
+        limit: z
+          .number()
+          .optional()
+          .describe("Max items to return (default: 50)."),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({ project, repository, path, branch, limit = 50 }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const endpoint = path
+          ? `projects/${resolvedProject}/repos/${repository}/browse/${path}`
+          : `projects/${resolvedProject}/repos/${repository}/browse`;
+
+        const searchParams: Record<string, string | number> = { limit };
+        if (branch) searchParams.at = branch;
+
+        const data = await clients.api.get(endpoint, { searchParams }).json();
+        return formatResponse(data);
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_file_content",
+    {
+      description:
+        "Read file contents from a repository with pagination support for large files.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        filePath: z.string().describe("Path to the file in the repository."),
+        branch: z
+          .string()
+          .optional()
+          .describe("Branch or commit hash (default: default branch)."),
+        limit: z
+          .number()
+          .optional()
+          .describe("Max lines per request (default: 100, max: 1000)."),
+        start: z
+          .number()
+          .optional()
+          .describe("Starting line number (default: 0)."),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      project,
+      repository,
+      filePath,
+      branch,
+      limit = 100,
+      start = 0,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const searchParams: Record<string, string | number> = { limit, start };
+        if (branch) searchParams.at = branch;
+
+        const data = await clients.api
+          .get(
+            `projects/${resolvedProject}/repos/${repository}/browse/${filePath}`,
+            { searchParams },
+          )
+          .json();
+
+        return formatResponse(data);
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "upload_attachment",
+    {
+      description:
+        "Upload a file attachment to a repository. Returns a markdown reference to embed in PR comments or descriptions.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        filePath: z
+          .string()
+          .describe("Absolute path to the file on the local filesystem."),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        idempotentHint: false,
+      }),
+    },
+    async ({ project, repository, filePath }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+
+        const fileBuffer = await readFile(filePath);
+        const fileName = basename(filePath);
+        const blob = new Blob([fileBuffer]);
+        const formData = new FormData();
+        formData.append("files", blob, fileName);
+
+        const data = await clients.api
+          .post(`projects/${resolvedProject}/repos/${repository}/attachments`, {
+            body: formData,
+          })
+          .json<{
+            attachments: Array<{
+              id: number;
+              url: string;
+              links: {
+                self: { href: string };
+                attachment: { href: string };
+              };
+            }>;
+          }>();
+
+        const attachment = data.attachments[0];
+        const ref = attachment.links.attachment.href;
+        const isImage = /\.(png|jpe?g|gif|svg|webp|bmp|ico)$/i.test(fileName);
+        const markdown = isImage
+          ? `![${fileName}](${ref})`
+          : `[${fileName}](${ref})`;
+
+        return formatResponse({
+          id: attachment.id,
+          url: attachment.url,
+          ref,
+          markdown,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "edit_file",
+    {
+      description:
+        "Edit a file in a repository by committing a new version via the Bitbucket REST API. Returns the commit metadata.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        filePath: z.string().describe("Path to the file in the repository."),
+        branch: z.string().describe("Target branch name."),
+        content: z.string().describe("Full new file content as a string."),
+        message: z.string().describe("Commit message."),
+        sourceCommitId: z
+          .string()
+          .optional()
+          .describe(
+            "Current commit ID for optimistic locking. If provided and the branch has advanced, the request will fail with a 409 conflict.",
+          ),
+        sourceBranch: z
+          .string()
+          .optional()
+          .describe("Fork point branch when creating a new branch."),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        idempotentHint: false,
+      }),
+    },
+    async ({
+      project,
+      repository,
+      filePath,
+      branch,
+      content,
+      message,
+      sourceCommitId,
+      sourceBranch,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+
+        const formData = new FormData();
+        formData.append("branch", branch);
+        formData.append("content", content);
+        formData.append("message", message);
+        if (sourceCommitId) formData.append("sourceCommitId", sourceCommitId);
+        if (sourceBranch) formData.append("sourceBranch", sourceBranch);
+
+        const data = await clients.api
+          .put(
+            `projects/${resolvedProject}/repos/${repository}/browse/${filePath}`,
+            { body: formData },
+          )
+          .json();
+
+        return formatResponse(data);
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_file_blame",
+    {
+      description:
+        "Get blame/history information for a file. Returns line-by-line commit authorship data.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        filePath: z.string().describe("Path to the file in the repository."),
+        branch: z
+          .string()
+          .optional()
+          .describe("Branch or commit hash (default: default branch)."),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({ project, repository, filePath, branch }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const searchParams: Record<string, string> = { blame: "" };
+        if (branch) searchParams.at = branch;
+
+        const data = await clients.api
+          .get(
+            `projects/${resolvedProject}/repos/${repository}/browse/${filePath}`,
+            { searchParams },
+          )
+          .json();
+
+        return formatResponse(data);
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "create_repository",
+    {
+      description: "Create a new repository in a project.",
+      inputSchema: {
+        project: projectParam(),
+        name: z.string().describe("Repository name."),
+        description: z.string().optional().describe("Repository description."),
+        defaultBranch: z
+          .string()
+          .optional()
+          .describe("Default branch name (defaults to 'main' if not set)."),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        idempotentHint: false,
+      }),
+    },
+    async ({ project, name, description, defaultBranch }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const body: Record<string, unknown> = { name };
+        if (description) body.description = description;
+        if (defaultBranch) body.defaultBranch = defaultBranch;
+
+        const data = await clients.api
+          .post(`projects/${resolvedProject}/repos`, { json: body })
+          .json<Record<string, unknown>>();
+
+        return formatResponse(curateResponse(data, DEFAULT_REPOSITORY_FIELDS));
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_repository",
+    {
+      description: "Delete a repository. This action is irreversible.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      }),
+    },
+    async ({ project, repository }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        await clients.api.delete(
+          `projects/${resolvedProject}/repos/${repository}`,
+        );
+
+        return formatResponse({ deleted: true, repository });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+}

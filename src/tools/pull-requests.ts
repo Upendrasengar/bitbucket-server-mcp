@@ -1,0 +1,930 @@
+import { z } from "zod";
+import { formatResponse, type ToolSuccessResult } from "../response/format.js";
+import { toolAnnotations } from "../response/annotations.js";
+import { handleToolError } from "../http/errors.js";
+import { truncateDiff } from "../diff.js";
+import {
+  curateResponse,
+  curateList,
+  DEFAULT_PR_FIELDS,
+  DEFAULT_COMMIT_FIELDS,
+  DEFAULT_ACTIVITY_FIELDS,
+} from "../response/curate.js";
+import { getPaginated } from "../http/client.js";
+import type { ApiClients } from "../http/client.js";
+import { mergeDefaultReviewers } from "./shared.js";
+import type { ToolContext } from "./shared.js";
+import {
+  projectParam,
+  repositoryParam,
+  limitParam,
+  startParam,
+  fieldsParam,
+} from "./params.js";
+import type {
+  PullRequest as BasePullRequest,
+  PullRequestActivity,
+  PullRequestMergeRequest,
+  PullRequestDeclineRequest,
+} from "../generated/types.js";
+
+// Extend generated types with fields we know are present in API responses
+// Extend: the API returns these fields but the 8.5 spec marks them optional or missing
+type PullRequest = BasePullRequest & {
+  version: number;
+  author?: { user?: { name?: string; slug?: string; displayName?: string } };
+  fromRef: {
+    id: string;
+    displayId: string;
+    latestCommit: string;
+    repository: { slug: string; project: { key: string } };
+  };
+  toRef: {
+    id: string;
+    displayId: string;
+    repository: { slug: string; project: { key: string } };
+  };
+};
+
+type Activity = PullRequestActivity & {
+  comment?: { author?: { name: string } };
+};
+
+// Create PR accepts RestPullRequest as body, but the API only needs a subset.
+// The spec's type requires fields (project.name, project.type) that aren't
+// needed for creation, so we keep a manual type for what we actually send.
+interface CreatePrBody {
+  title: string;
+  description?: string;
+  draft?: boolean;
+  fromRef: {
+    id: string;
+    repository: { slug: string; project: { key: string } };
+  };
+  toRef: {
+    id: string;
+    repository: { slug: string; project: { key: string } };
+  };
+  reviewers: Array<{ user: { name: string } }>;
+}
+
+export function registerPullRequestTools(ctx: ToolContext) {
+  const { server, clients } = ctx;
+  server.registerTool(
+    "create_pull_request",
+    {
+      description:
+        "Create a new pull request. Supports cross-repo PRs via sourceProject/sourceRepository and automatic default reviewer merging.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        title: z.string().describe("Pull request title."),
+        description: z
+          .string()
+          .optional()
+          .describe("Pull request description (Markdown supported)."),
+        sourceBranch: z.string().describe("Source branch name."),
+        targetBranch: z.string().describe("Target branch name."),
+        sourceProject: z
+          .string()
+          .optional()
+          .describe("Source project key for cross-repo PRs."),
+        sourceRepository: z
+          .string()
+          .optional()
+          .describe("Source repository slug for cross-repo PRs."),
+        reviewers: z
+          .array(z.string())
+          .optional()
+          .describe("Usernames to assign as reviewers."),
+        includeDefaultReviewers: z
+          .boolean()
+          .optional()
+          .describe(
+            "Merge default reviewers into the reviewer list (default: true).",
+          ),
+        draft: z
+          .boolean()
+          .optional()
+          .describe("Create the pull request as a draft."),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        idempotentHint: false,
+      }),
+    },
+    async ({
+      project,
+      repository,
+      title,
+      description,
+      sourceBranch,
+      targetBranch,
+      sourceProject,
+      sourceRepository,
+      reviewers,
+      includeDefaultReviewers,
+      draft,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const srcProject = sourceProject || resolvedProject;
+        const srcRepo = sourceRepository || repository;
+
+        const explicitReviewers = (reviewers ?? []).map((name) => ({
+          user: { name },
+        }));
+
+        const allReviewers =
+          includeDefaultReviewers !== false
+            ? await mergeDefaultReviewers({
+                clients,
+                resolvedProject,
+                repository,
+                srcProject,
+                srcRepo,
+                sourceBranch,
+                targetBranch,
+                existingReviewers: explicitReviewers,
+              })
+            : explicitReviewers;
+
+        const body: CreatePrBody = {
+          title,
+          description,
+          draft,
+          fromRef: {
+            id: `refs/heads/${sourceBranch}`,
+            repository: {
+              slug: srcRepo,
+              project: { key: srcProject },
+            },
+          },
+          toRef: {
+            id: `refs/heads/${targetBranch}`,
+            repository: {
+              slug: repository,
+              project: { key: resolvedProject },
+            },
+          },
+          reviewers: allReviewers,
+        };
+
+        const data = await clients.api
+          .post(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests`,
+            { json: body },
+          )
+          .json<Record<string, unknown>>();
+
+        return formatResponse(curateResponse(data, DEFAULT_PR_FIELDS));
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_pull_request",
+    {
+      description:
+        "Get details of a specific pull request including status, reviewers, and metadata. Supports custom field selection via the `fields` param (`'*all'` for full raw response, `'id,title,state'` for a custom subset).",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        fields: fieldsParam(),
+        includeMergeVetoes: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include merge vetoes from the /merge endpoint (default: false). Adds `mergeCheck` with canMerge, conflicted, outcome, and vetoes fields.",
+          ),
+        includeBuildSummaries: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include build summaries from the UI-layer endpoint (default: false). Adds `buildSummaries` with aggregated CI status per commit. May not be available in older Bitbucket deployments.",
+          ),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      project,
+      repository,
+      prId,
+      fields,
+      includeMergeVetoes,
+      includeBuildSummaries,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const basePath = `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`;
+
+        const [prData, mergeCheck, buildSummaries] = await Promise.all([
+          clients.api.get(basePath).json<PullRequest>(),
+          includeMergeVetoes
+            ? clients.api
+                .get(`${basePath}/merge`)
+                .json<Record<string, unknown>>()
+                .catch(() => null)
+            : null,
+          includeBuildSummaries
+            ? clients.ui
+                .get(`${basePath}/build-summaries`)
+                .json<Record<string, unknown>>()
+                .catch(() => null)
+            : null,
+        ]);
+
+        const curated = curateResponse(prData, fields ?? DEFAULT_PR_FIELDS);
+        const result: Record<string, unknown> = { ...curated };
+
+        if (mergeCheck) result.mergeCheck = mergeCheck;
+        if (buildSummaries) result.buildSummaries = buildSummaries;
+
+        return formatResponse(result);
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "update_pull_request",
+    {
+      description:
+        "Update a pull request (title, description, target branch, or reviewers). Only changed fields are applied; reviewers are preserved if not provided.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        title: z.string().optional().describe("New title."),
+        description: z.string().optional().describe("New description."),
+        targetBranch: z.string().optional().describe("New target branch."),
+        reviewers: z
+          .array(z.string())
+          .optional()
+          .describe("Replace reviewer list with these usernames."),
+      },
+      annotations: toolAnnotations({ readOnlyHint: false }),
+    },
+    async ({
+      project,
+      repository,
+      prId,
+      title,
+      description,
+      targetBranch,
+      reviewers,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+
+        // Fetch current PR state
+        const current = await clients.api
+          .get(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`,
+          )
+          .json<PullRequest>();
+
+        // Only send the fields the PUT endpoint accepts. Spreading the full
+        // PR object causes a 400 because the API rejects fields like `author`.
+        const updated: Record<string, unknown> = {
+          id: current.id,
+          version: current.version,
+          title: title ?? current.title,
+          description: description ?? current.description,
+          toRef: targetBranch
+            ? {
+                id: `refs/heads/${targetBranch}`,
+                displayId: current.toRef.displayId,
+                repository: current.toRef.repository,
+              }
+            : current.toRef,
+          reviewers: reviewers
+            ? reviewers.map((name) => ({ user: { name } }))
+            : current.reviewers,
+        };
+
+        const data = await clients.api
+          .put(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`,
+            { json: updated },
+          )
+          .json<Record<string, unknown>>();
+
+        return formatResponse(curateResponse(data, DEFAULT_PR_FIELDS));
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "merge_pull_request",
+    {
+      description:
+        "Merge an approved pull request. Fetches the current version automatically for optimistic locking.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        message: z.string().optional().describe("Custom merge commit message."),
+        strategy: z
+          .enum([
+            "no-ff",
+            "ff",
+            "ff-only",
+            "squash",
+            "squash-ff-only",
+            "rebase-no-ff",
+            "rebase-ff-only",
+          ])
+          .optional()
+          .describe(
+            "Merge strategy ID. no-ff = merge commit, ff = fast-forward, ff-only = fast-forward only, squash = squash, rebase-no-ff = rebase + merge commit, rebase-ff-only = rebase + fast-forward.",
+          ),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      }),
+    },
+    async ({ project, repository, prId, message, strategy }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+
+        // Fetch current version for optimistic locking
+        const pr = await clients.api
+          .get(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`,
+          )
+          .json<PullRequest>();
+
+        const body: PullRequestMergeRequest = { version: pr.version };
+        if (message) body.message = message;
+
+        const searchParams: Record<string, string> = {};
+        if (strategy) searchParams.strategyId = strategy;
+
+        const data = await clients.api
+          .post(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}/merge`,
+            { json: body, searchParams },
+          )
+          .json<Record<string, unknown>>();
+
+        return formatResponse(curateResponse(data, DEFAULT_PR_FIELDS));
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "decline_pull_request",
+    {
+      description:
+        "Decline a pull request. Fetches the current version automatically for optimistic locking.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        message: z.string().optional().describe("Reason for declining."),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+      }),
+    },
+    async ({ project, repository, prId, message }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+
+        // Fetch current version for optimistic locking
+        const pr = await clients.api
+          .get(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`,
+          )
+          .json<PullRequest>();
+
+        const body: PullRequestDeclineRequest = {
+          version: pr.version,
+          ...(message && { comment: message }),
+        };
+
+        const data = await clients.api
+          .post(
+            `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}/decline`,
+            { json: body },
+          )
+          .json<Record<string, unknown>>();
+
+        return formatResponse(curateResponse(data, DEFAULT_PR_FIELDS));
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_pull_requests",
+    {
+      description:
+        "List pull requests in a repository. Supports filtering by state, direction, order, and client-side author filtering. Supports custom field selection via the `fields` param (`'*all'` for full raw response, `'id,title,state'` for a custom subset).",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        state: z
+          .enum(["OPEN", "MERGED", "DECLINED", "ALL"])
+          .optional()
+          .describe("Filter by state (default: OPEN)."),
+        author: z
+          .string()
+          .optional()
+          .describe(
+            "Client-side filter by author username/displayName. Only filters the current page of results. Use with start/limit to paginate for more matches.",
+          ),
+        direction: z
+          .enum(["INCOMING", "OUTGOING"])
+          .optional()
+          .describe("PR direction filter."),
+        order: z.enum(["OLDEST", "NEWEST"]).optional().describe("Sort order."),
+        limit: limitParam(),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      project,
+      repository,
+      state,
+      author,
+      direction,
+      order,
+      limit = 25,
+      start = 0,
+      fields,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const searchParams: Record<string, string | number | boolean> = {
+          limit,
+          start,
+        };
+        if (state) searchParams.state = state;
+        if (direction) searchParams.direction = direction;
+        if (order) searchParams.order = order;
+
+        const data = await getPaginated(
+          clients.api,
+          `projects/${resolvedProject}/repos/${repository}/pull-requests`,
+          { searchParams },
+        );
+
+        let pullRequests = data.values as PullRequest[];
+
+        if (author) {
+          const authorLower = author.toLowerCase();
+          pullRequests = pullRequests.filter((pr) => {
+            const u = pr.author?.user;
+            return (
+              u?.name?.toLowerCase() === authorLower ||
+              u?.slug?.toLowerCase() === authorLower ||
+              u?.displayName?.toLowerCase().includes(authorLower)
+            );
+          });
+        }
+
+        return formatResponse({
+          total: author ? pullRequests.length : data.size,
+          pullRequests: curateList(pullRequests, fields ?? DEFAULT_PR_FIELDS),
+          isLastPage: data.isLastPage,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "list_dashboard_pull_requests",
+    {
+      description:
+        "Get pull requests from the authenticated user dashboard. No project/repo needed. Supports custom field selection via the `fields` param (`'*all'` for full raw response, `'id,title,state'` for a custom subset).",
+      inputSchema: {
+        state: z
+          .enum(["OPEN", "MERGED", "DECLINED", "ALL"])
+          .optional()
+          .describe("Filter by state."),
+        role: z
+          .enum(["AUTHOR", "REVIEWER", "PARTICIPANT"])
+          .optional()
+          .describe("Filter by user role."),
+        participantStatus: z
+          .enum(["APPROVED", "UNAPPROVED", "NEEDS_WORK"])
+          .optional()
+          .describe("Filter by participant status."),
+        order: z.enum(["OLDEST", "NEWEST"]).optional().describe("Sort order."),
+        closedSince: z
+          .number()
+          .optional()
+          .describe("Only return PRs closed after this timestamp (epoch ms)."),
+        limit: limitParam(),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      state,
+      role,
+      participantStatus,
+      order,
+      closedSince,
+      limit = 25,
+      start = 0,
+      fields,
+    }) => {
+      try {
+        const searchParams: Record<string, string | number> = { limit, start };
+        if (state) searchParams.state = state;
+        if (role) searchParams.role = role;
+        if (participantStatus)
+          searchParams.participantStatus = participantStatus;
+        if (order) searchParams.order = order;
+        if (closedSince) searchParams.closedSince = closedSince;
+
+        const data = await getPaginated(
+          clients.api,
+          "dashboard/pull-requests",
+          {
+            searchParams,
+          },
+        );
+
+        return formatResponse({
+          ...data,
+          values: curateList(data.values, fields ?? DEFAULT_PR_FIELDS),
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_pull_request_activity",
+    {
+      description:
+        "Get activity feed for a pull request. Optionally filter to only reviews or comments.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        filter: z
+          .enum(["all", "reviews", "comments"])
+          .optional()
+          .describe("Filter activity type (default: all)."),
+        excludeUsers: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Usernames to exclude from results (e.g. bot accounts like sa_sec_appsec_auto).",
+          ),
+        limit: limitParam(),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      project,
+      repository,
+      prId,
+      filter = "all",
+      excludeUsers,
+      limit = 25,
+      start = 0,
+      fields,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const data = await getPaginated(
+          clients.api,
+          `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}/activities`,
+          { searchParams: { limit, start } },
+        );
+
+        let activities = data.values as Activity[];
+
+        if (excludeUsers?.length) {
+          const excluded = new Set(excludeUsers.map((u) => u.toLowerCase()));
+          activities = activities.filter((a) => {
+            const user = a.user?.name ?? a.comment?.author?.name ?? "";
+            return !excluded.has(user.toLowerCase());
+          });
+        }
+
+        if (filter === "reviews") {
+          activities = activities.filter(
+            (a) => a.action === "APPROVED" || a.action === "REVIEWED",
+          );
+        } else if (filter === "comments") {
+          activities = activities.filter((a) => a.action === "COMMENTED");
+        }
+
+        return formatResponse({
+          activities: curateList(activities, fields ?? DEFAULT_ACTIVITY_FIELDS),
+          size: data.size,
+          isLastPage: data.isLastPage,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_diff",
+    {
+      description:
+        "Get the diff of a pull request. Use stat=true for a lightweight summary of changed files (and line counts if the server supports it) instead of the full diff.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        stat: z
+          .boolean()
+          .optional()
+          .describe(
+            "If true, return only the list of changed files and types (ADD, MODIFY, DELETE, RENAME, COPY) instead of the full diff. Line count summary included when available (Bitbucket DC 9.1+).",
+          ),
+        filePath: z
+          .string()
+          .optional()
+          .describe(
+            "Path to a specific file to get the diff for. Use with stat=true first to discover file paths, then request individual diffs.",
+          ),
+        contextLines: z
+          .number()
+          .optional()
+          .describe(
+            "Number of context lines around changes (default: 10). Ignored when stat=true.",
+          ),
+        maxLinesPerFile: z
+          .number()
+          .optional()
+          .describe(
+            "Max lines per file. 0 = no limit. Defaults to BITBUCKET_DIFF_MAX_LINES_PER_FILE. Ignored when stat=true.",
+          ),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      project,
+      repository,
+      prId,
+      stat,
+      filePath,
+      contextLines = 10,
+      maxLinesPerFile,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const basePath = `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`;
+
+        if (stat) {
+          const changesData = await clients.api
+            .get(`${basePath}/changes`, {
+              searchParams: { limit: 1000 },
+            })
+            .json<{
+              values: Array<{
+                path: { toString: string };
+                type: string;
+                nodeType: string;
+              }>;
+            }>();
+
+          const files = changesData.values.map((c) => ({
+            path: c.path.toString,
+            type: c.type,
+          }));
+
+          let summary: Record<string, number> | undefined;
+          try {
+            summary = await clients.api
+              .get(`${basePath}/diff-stats-summary`)
+              .json<Record<string, number>>();
+          } catch {
+            // diff-stats-summary only available on Bitbucket DC 9.1+
+          }
+
+          return formatResponse({
+            files,
+            totalFiles: files.length,
+            ...(summary && { summary }),
+          });
+        }
+
+        const diffUrl = filePath
+          ? `${basePath}/diff/${filePath}`
+          : `${basePath}/diff`;
+        const rawDiff = await clients.api
+          .get(diffUrl, {
+            searchParams: { contextLines, withComments: false },
+            headers: { Accept: "text/plain" },
+          })
+          .text();
+
+        const effectiveMaxLines =
+          maxLinesPerFile !== undefined ? maxLinesPerFile : ctx.maxLinesPerFile;
+
+        const diffContent = effectiveMaxLines
+          ? truncateDiff(rawDiff, effectiveMaxLines)
+          : rawDiff;
+
+        return formatResponse(diffContent);
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+  server.registerTool(
+    "get_pull_request_commits",
+    {
+      description:
+        "List commits for a specific pull request. Returns the commits that are part of the pull request with pagination support.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        limit: limitParam(),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({ project, repository, prId, limit = 25, start = 0, fields }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const data = await getPaginated(
+          clients.api,
+          `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}/commits`,
+          { searchParams: { limit, start } },
+        );
+
+        return formatResponse({
+          total: data.size,
+          commits: curateList(data.values, fields ?? DEFAULT_COMMIT_FIELDS),
+          isLastPage: data.isLastPage,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "get_commit_pull_requests",
+    {
+      description:
+        "List pull requests that contain a specific commit. Returns the PRs that include the given commit.",
+      inputSchema: {
+        project: projectParam(),
+        repository: repositoryParam(),
+        commitId: z.string().describe("Full commit hash."),
+        limit: limitParam(),
+        start: startParam(),
+        fields: fieldsParam(),
+      },
+      annotations: toolAnnotations(),
+    },
+    async ({
+      project,
+      repository,
+      commitId,
+      limit = 25,
+      start = 0,
+      fields,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const data = await getPaginated(
+          clients.api,
+          `projects/${resolvedProject}/repos/${repository}/commits/${commitId}/pull-requests`,
+          { searchParams: { limit, start } },
+        );
+
+        return formatResponse({
+          total: data.size,
+          pullRequests: curateList(data.values, fields ?? DEFAULT_PR_FIELDS),
+          isLastPage: data.isLastPage,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+}
+
+interface ReviewActionContext {
+  clients: ApiClients;
+  prPath: string;
+  prId: number;
+  commentText?: string;
+  participantStatus?: "APPROVED" | "NEEDS_WORK";
+}
+
+interface PublishReviewBody {
+  commentText: string | null;
+  participantStatus?: string;
+}
+
+const reviewActions: Record<
+  string,
+  (ctx: ReviewActionContext) => Promise<ToolSuccessResult>
+> = {
+  approve: async ({ clients, prPath }) => {
+    const data = await clients.api
+      .post(`${prPath}/approve`, { json: {} })
+      .json();
+    return formatResponse(data);
+  },
+
+  unapprove: async ({ clients, prPath, prId }) => {
+    await clients.api.delete(`${prPath}/approve`);
+    return formatResponse({ unapproved: true, prId });
+  },
+
+  publish: async ({ clients, prPath, commentText, participantStatus }) => {
+    const body: PublishReviewBody = {
+      commentText: commentText ?? null,
+      ...(participantStatus && { participantStatus }),
+    };
+    const data = await clients.api
+      .put(`${prPath}/review`, { json: body })
+      .json();
+    return formatResponse(data);
+  },
+};
+
+export function registerReviewTools(ctx: ToolContext) {
+  const { server, clients } = ctx;
+
+  server.registerTool(
+    "manage_review",
+    {
+      description:
+        'Approve, unapprove, or publish a review on a pull request. Use "approve" to approve, "unapprove" to remove your approval, and "publish" to submit a review with an optional overview comment and status.',
+      inputSchema: {
+        action: z
+          .enum(["approve", "unapprove", "publish"])
+          .describe("Review action to perform."),
+        project: projectParam(),
+        repository: repositoryParam(),
+        prId: z.coerce.number().describe("Pull request ID."),
+        commentText: z
+          .string()
+          .optional()
+          .describe("Overview comment text (for publish action)."),
+        participantStatus: z
+          .enum(["APPROVED", "NEEDS_WORK"])
+          .optional()
+          .describe("Participant status to set (for publish action)."),
+      },
+      annotations: toolAnnotations({
+        readOnlyHint: false,
+        idempotentHint: false,
+      }),
+    },
+    async ({
+      action,
+      project,
+      repository,
+      prId,
+      commentText,
+      participantStatus,
+    }) => {
+      try {
+        const resolvedProject = ctx.resolveProject(project);
+        const prPath = `projects/${resolvedProject}/repos/${repository}/pull-requests/${prId}`;
+        const handler = reviewActions[action];
+        return await handler({
+          clients,
+          prPath,
+          prId,
+          commentText,
+          participantStatus,
+        });
+      } catch (error) {
+        return handleToolError(error);
+      }
+    },
+  );
+}
