@@ -43,7 +43,7 @@ describe("list_merge_checks", () => {
         enabled: boolean;
       }>
     >(h.client, "list_merge_checks", { project: "P", repository: "r" });
-    expect(parsed.length).toBe(1);
+    expect(parsed).toHaveLength(1);
     expect(parsed[0].key).toBe(
       "com.atlassian.bitbucket.server.bitbucket-build.requiredBuildsMergeCheck",
     );
