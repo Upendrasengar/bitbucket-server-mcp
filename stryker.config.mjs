@@ -1,0 +1,17 @@
+/** @type {import('@stryker-mutator/api/core').PartialStrykerOptions} */
+const config = {
+  testRunner: "vitest",
+  checkers: ["typescript"],
+  tsconfigFile: "tsconfig.json",
+  mutate: ["src/**/*.ts", "!src/__tests__/**", "!src/generated/**"],
+  reporters: ["html", "json", "clear-text", "progress", "dashboard"],
+  coverageAnalysis: "perTest",
+  thresholds: { break: 90 },
+  incremental: true,
+  incrementalFile: "reports/stryker-incremental.json",
+  dashboard: {
+    project: "github.com/upendrasengar/bitbucket-server-mcp",
+    version: process.env.GITHUB_REF_NAME || "main",
+  },
+};
+export default config;
