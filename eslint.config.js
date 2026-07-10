@@ -35,6 +35,14 @@ export default tseslint.config(
     },
   },
   {
+    // Assertions live inside shared helpers (callAndParse, expectCalledWith* in
+    // tool-test-utils.ts), which this rule cannot see into.
+    files: ["src/__tests__/**"],
+    rules: {
+      "sonarjs/assertions-in-tests": "off",
+    },
+  },
+  {
     ignores: ["build/**", "node_modules/**", "src/generated/bitbucket-api.d.ts"],
   },
 );
