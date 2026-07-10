@@ -11,9 +11,6 @@
 <br>
 [![CI](https://github.com/upendrasengar/bitbucket-server-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/upendrasengar/bitbucket-server-mcp/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/upendrasengar/bitbucket-server-mcp/actions/workflows/codeql.yml/badge.svg)](https://github.com/upendrasengar/bitbucket-server-mcp/actions/workflows/codeql.yml)
-[![codecov](https://codecov.io/gh/upendrasengar/bitbucket-server-mcp/graph/badge.svg)](https://codecov.io/gh/upendrasengar/bitbucket-server-mcp)
-[![Mutation testing](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fupendrasengar%2Fbitbucket-server-mcp%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/upendrasengar/bitbucket-server-mcp/main)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/upendrasengar/bitbucket-server-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/upendrasengar/bitbucket-server-mcp)
 
 </div>
 
