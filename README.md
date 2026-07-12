@@ -294,8 +294,24 @@ Or build locally: `docker build -t bitbucket-mcp .`
 | `BITBUCKET_CACHE_TTL` | No | Cache duration in seconds (default: 300). Set to `0` to disable caching. |
 | `BITBUCKET_ENABLED_TOOLS` | No | Comma-separated list of tool names to enable. If not set, all tools are available. |
 | `BITBUCKET_STARTUP_HEALTHCHECK` | No | Set to `true` to run a connectivity check against Bitbucket on startup (default: `false`). |
+| `HTTPS_PROXY` | No | HTTP/HTTPS proxy URL (e.g. `http://proxy.corp.com:8080`). Useful in corporate environments. |
+| `NODE_EXTRA_CA_CERTS` | No | Path to a PEM file with additional CA certificates. Use when Bitbucket is behind a self-signed TLS cert. |
 
 *Either `BITBUCKET_TOKEN` or both `BITBUCKET_USERNAME` and `BITBUCKET_PASSWORD` are required.
+
+### Token Permissions
+
+The Personal Access Token needs the following Bitbucket permissions depending on what you intend to do:
+
+| Permission | Required for |
+|------------|-------------|
+| **Project read** | `list_projects`, `list_repositories`, `browse_repository`, `get_file_content` |
+| **Repository read** | All read tools (branches, commits, tags, diff, blame) |
+| **Repository write** | `edit_file`, `manage_branches`, `manage_tags`, `create_repository`, `delete_repository` |
+| **Pull request read** | `list_pull_requests`, `get_pull_request`, `get_diff`, `get_pull_request_commits` |
+| **Pull request write** | `create_pull_request`, `update_pull_request`, `merge_pull_request`, `decline_pull_request`, `manage_comment`, `manage_review` |
+
+For a read-only setup, Project read + Repository read + Pull request read is sufficient.
 
 ### Read-Only Mode
 
@@ -335,6 +351,60 @@ Read tools return compact responses by default, keeping only the fields an AI as
 The server caches frequently accessed data in memory (project lists, repository metadata, default reviewers) to reduce API calls. The cache uses LRU eviction (max 500 entries) so memory stays bounded, and write operations automatically invalidate related entries.
 
 By default, cached entries expire after 5 minutes. Configure with `BITBUCKET_CACHE_TTL` (in seconds), or set to `0` to disable caching entirely.
+
+## Bitbucket Cloud
+
+This server targets **Bitbucket Server / Data Center only**. Bitbucket Cloud (bitbucket.org) uses a different REST API and is not supported.
+
+## Usage Examples
+
+### List open PRs assigned to you for review
+
+```
+list_dashboard_pull_requests with role=REVIEWER, state=OPEN
+```
+
+### Create an inline draft comment on a PR
+
+```
+manage_comment with prId=42, filePath="src/auth.ts", line=17, lineType="ADDED",
+text="This token is never invalidated — add expiry.", state="PENDING"
+```
+
+Then publish all draft comments at once:
+
+```
+manage_review with prId=42, action="publish", participantStatus="NEEDS_WORK"
+```
+
+### Get a lightweight diff summary without reading every line
+
+```
+get_diff with prId=42, stat=true
+```
+
+### Enable only the tools you need (reduces context window usage)
+
+```console
+BITBUCKET_ENABLED_TOOLS=get_pull_request,get_diff,manage_comment,manage_review
+```
+
+## Troubleshooting
+
+**`UNABLE_TO_VERIFY_LEAF_SIGNATURE` or self-signed certificate errors**
+Set `NODE_EXTRA_CA_CERTS=/path/to/your-ca-bundle.pem` to point Node.js at your internal CA.
+
+**`403 Forbidden` on write operations**
+Your token is missing a write-level permission. See the Token Permissions table above for the exact scope needed.
+
+**Server starts but can't reach Bitbucket**
+Enable `BITBUCKET_STARTUP_HEALTHCHECK=true` — it will log a diagnostic line showing which env vars are missing or misconfigured. In corporate environments also set `HTTPS_PROXY`.
+
+**`401 Unauthorized`**
+Token auth and basic auth are mutually exclusive. Set either `BITBUCKET_TOKEN` alone, or both `BITBUCKET_USERNAME` + `BITBUCKET_PASSWORD`. Having all three set will cause unpredictable behaviour — remove whichever pair you don't intend to use.
+
+**Tool not found / unexpected behaviour on older Bitbucket versions**
+Some tools require Bitbucket 8.5+ (e.g. `list_secret_scanning_rules`). Check the tool description in the [Tools](#tools) section for version requirements. The E2E suite covers 7.21, 8.5, 8.9, 8.19, 9.4, and 10.2.
 
 ## Contributing
 
