@@ -1,0 +1,116 @@
+import { describe, test, expect } from "vitest";
+import { registerLabelTools } from "../../tools/labels.js";
+import { mockJson, mockReject } from "../test-utils.js";
+import { callAndParse, callRaw, expectCalledWith, expectCalledWithJson, setupToolHarness, } from "../tool-test-utils.js";
+describe("list_labels", () => {
+    const h = setupToolHarness({
+        register: registerLabelTools,
+        defaultProject: "DEFAULT",
+    });
+    test("returns labels from the API", async () => {
+        mockJson(h.mockClients.api.get, {
+            values: [{ name: "bug" }, { name: "feature" }],
+            size: 2,
+            isLastPage: true,
+        });
+        const parsed = await callAndParse(h.client, "list_labels", {
+            project: "TEST",
+            repository: "my-repo",
+        });
+        expect(parsed.total).toBe(2);
+        expect(parsed.labels).toHaveLength(2);
+        expect(parsed.labels[0].name).toBe("bug");
+    });
+    test("returns empty list when no labels exist", async () => {
+        mockJson(h.mockClients.api.get, {
+            values: [],
+            size: 0,
+            isLastPage: true,
+        });
+        const parsed = await callAndParse(h.client, "list_labels", {
+            project: "TEST",
+            repository: "my-repo",
+        });
+        expect(parsed.total).toBe(0);
+    });
+    test("returns isLastPage false for multi-page responses", async () => {
+        mockJson(h.mockClients.api.get, {
+            values: [{ name: "bug" }],
+            size: 100,
+            isLastPage: false,
+        });
+        const parsed = await callAndParse(h.client, "list_labels", {
+            project: "TEST",
+            repository: "my-repo",
+        });
+        expect(parsed.total).toBe(100);
+        expect(parsed.isLastPage).toBe(false);
+        expect(h.mockClients.api.get).toHaveBeenCalledWith("projects/TEST/repos/my-repo/labels", expect.objectContaining({ searchParams: { limit: 25, start: 0 } }));
+    });
+    test("uses default project when not provided", async () => {
+        mockJson(h.mockClients.api.get, {
+            values: [],
+            size: 0,
+            isLastPage: true,
+        });
+        await callAndParse(h.client, "list_labels", {
+            repository: "my-repo",
+        });
+        expect(h.mockClients.api.get).toHaveBeenCalledWith("projects/DEFAULT/repos/my-repo/labels", expect.anything());
+    });
+    test("returns error when API call fails", async () => {
+        mockReject(h.mockClients.api.get, new Error("Not found"));
+        const result = await callRaw(h.client, "list_labels", {
+            project: "TEST",
+            repository: "my-repo",
+        });
+        expect(result.isError).toBe(true);
+    });
+});
+describe("manage_labels", () => {
+    const h = setupToolHarness({
+        register: registerLabelTools,
+        defaultProject: "DEFAULT",
+    });
+    test("adds a label", async () => {
+        mockJson(h.mockClients.api.post, { name: "urgent" });
+        const parsed = await callAndParse(h.client, "manage_labels", {
+            action: "add",
+            project: "TEST",
+            repository: "my-repo",
+            name: "urgent",
+        });
+        expect(parsed.name).toBe("urgent");
+        expectCalledWithJson(h.mockClients.api.post, "projects/TEST/repos/my-repo/labels", { name: "urgent" });
+    });
+    test("removes a label", async () => {
+        mockJson(h.mockClients.api.delete, {});
+        const parsed = await callAndParse(h.client, "manage_labels", {
+            action: "remove",
+            project: "TEST",
+            repository: "my-repo",
+            name: "urgent",
+        });
+        expect(parsed.deleted).toBe(true);
+        expect(parsed.label).toBe("urgent");
+        expectCalledWith(h.mockClients.api.delete, "projects/TEST/repos/my-repo/labels/urgent");
+    });
+    test.each([
+        { action: "add", mockMethod: "post", name: "urgent" },
+        {
+            action: "remove",
+            mockMethod: "delete",
+            name: "nonexistent",
+        },
+    ])("returns error when $action fails", async ({ action, mockMethod, name }) => {
+        mockReject(h.mockClients.api[mockMethod], new Error("fail"));
+        const result = await callRaw(h.client, "manage_labels", {
+            action,
+            project: "TEST",
+            repository: "my-repo",
+            name,
+        });
+        expect(result.isError).toBe(true);
+    });
+});
+//# sourceMappingURL=labels.test.js.map

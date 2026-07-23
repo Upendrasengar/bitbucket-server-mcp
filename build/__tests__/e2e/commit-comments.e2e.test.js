@@ -1,0 +1,32 @@
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
+import { SELECTED_VERSIONS } from "./versions.js";
+import { startBitbucket, } from "./bitbucket-container.js";
+import { bootstrap } from "./bootstrap.js";
+import { setupMcpAgainst } from "./mcp-harness.js";
+import { callAndParse } from "../tool-test-utils.js";
+describe.each(SELECTED_VERSIONS)("commit-comments: Bitbucket $name", (version) => {
+    let bb;
+    let mcp;
+    let s;
+    beforeAll(async () => {
+        bb = await startBitbucket(version);
+        s = await bootstrap(bb.api);
+        mcp = await setupMcpAgainst(bb);
+    }, 420_000);
+    afterAll(async () => {
+        await mcp?.close();
+        await bb?.stop();
+    });
+    test("manage_commit_comments create adds a comment", async () => {
+        const parsed = await callAndParse(mcp.client, "manage_commit_comments", {
+            action: "create",
+            project: s.projectKey,
+            repository: s.repoSlug,
+            commitId: s.mainCommitId,
+            text: "E2E commit comment",
+        });
+        expect(parsed.id).toBeDefined();
+        expect(parsed.text).toBe("E2E commit comment");
+    });
+});
+//# sourceMappingURL=commit-comments.e2e.test.js.map

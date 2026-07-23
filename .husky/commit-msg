@@ -1,1 +1,2 @@
+export PATH="/usr/local/bin:$HOME/.nvm/versions/node/$(cat "$(dirname "$0")/../.node-version" 2>/dev/null || echo current)/bin:$PATH"
 npx --no -- commitlint --edit $1
